@@ -1,0 +1,214 @@
+#!/usr/bin/python3
+#
+# CS3700, Fall 2021
+# TCP Project Starter Code
+#
+
+import datetime
+import json
+import sys
+import socket
+import select
+import time
+
+from base64 import b64encode
+
+
+MSG_SIZE = 1500
+DATA_SIZE = 1000
+TIMEOUT = 30
+SEQUENCE = 0
+ALPHA = 0.875
+RTT = 550
+LAST_PACKET_TIME = 0
+WINDOW = 30
+SLIDING_WINDOW = 30
+PACKETS = {}  # Stores all the packets we still have to send based on sequence number
+OUT_COUNT = 0
+SENT_LAST_PACKET = False
+
+
+# Bind to localhost and an ephemeral port
+IP_PORT = sys.argv[1]
+UDP_IP = IP_PORT[0:IP_PORT.find(":")]
+UDP_PORT = int(IP_PORT[IP_PORT.find(":")+1:])
+dest = (UDP_IP, UDP_PORT)
+
+time.sleep(.5)
+
+# Set up the socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(TIMEOUT)
+
+# Helper so we can track RTTs
+def get_time():
+    return int(time.time() * 1000)
+
+# Logs given string
+def log(string):
+    sys.stderr.write(datetime.datetime.now().strftime(
+        "%H:%M:%S.%f") + " 3700send: " + string + "\n")
+
+def send_next_packet():
+    global PACKETS
+    global SEQUENCE
+    global OUT_COUNT
+    global SENT_LAST_PACKET
+
+    data = sys.stdin.buffer.read(DATA_SIZE)
+    length = len(data)
+    if length > 0:
+        msg = {"sequence": SEQUENCE, "data": b64encode(
+                data).decode(), "ack": False, "eof": False}
+        if sock.sendto(json.dumps(msg).encode(), dest) < len(msg):
+            log("[error] unable to fully send packet")
+        else:
+            log("[send data] " + str(SEQUENCE) + " (" + str(length) + ")")
+            OUT_COUNT += 1
+            PACKETS[SEQUENCE] = (msg, length, get_time() + 2 * RTT)
+            SEQUENCE += length
+        return True
+    elif not SENT_LAST_PACKET:
+        msg = {"sequence": SEQUENCE, "data": "", "ack": False, "eof": True}
+        sock.sendto(json.dumps(msg).encode(), dest)
+        SENT_LAST_PACKET = True
+        OUT_COUNT += 1
+        PACKETS[SEQUENCE] = (msg, length, get_time() + 2 * RTT)
+        SEQUENCE += length
+        return True
+    return False
+        
+# Initial function to create all the packets to be sent
+def get_packets():
+    global PACKETS
+    global SEQUENCE
+
+    while True:
+        data = sys.stdin.buffer.read(DATA_SIZE)
+        # print(str(b64encode(data)))
+        if len(data) > 0:
+            msg = {"sequence": SEQUENCE, "data": b64encode(
+                data).decode(), "ack": False, "eof": False}
+            PACKETS[SEQUENCE] = (msg, len(data))
+            SEQUENCE += len(data)
+        else:
+            msg = {"eof": True, "data": "", "sequence": SEQUENCE, "ack": False}
+            PACKETS[SEQUENCE] = (msg, len(data))
+            SEQUENCE += len(data)
+            break
+
+# Send all packets in PACKETS
+def send_all_packets():
+    global PACKETS
+
+    for key in PACKETS:
+        msg, data_len = PACKETS[key]
+        if sock.sendto(json.dumps(msg).encode(), dest) < len(msg):
+            log("[error] unable to fully send packet")
+        else:
+            log("[send data] " + str(key) + " (" + str(data_len) + ")")
+
+def transmit_timed_out():
+    global PACKETS
+
+    for key in PACKETS:
+        if get_time() > PACKETS[key][2]:
+            msg = PACKETS[key][0]
+            if sock.sendto(json.dumps(msg).encode(), dest) < len(msg):
+                log("[error] unable to fully send packet")
+            else:
+                log("[send data] " + str(SEQUENCE) + " (" + str(PACKETS[key][1]) + ")")
+                PACKETS[SEQUENCE] = (msg, PACKETS[key][1], get_time() + 2 * RTT)
+
+
+def find_ack():
+    global PACKETS
+    global OUT_COUNT
+    global LAST_PACKET_TIME
+    global sock
+    
+    result = sock.recvfrom(MSG_SIZE)
+    if result:
+        LAST_PACKET_TIME = get_time()
+        (data, addr) = result
+        try:
+            decoded = json.loads(data.decode())
+            log("[recv pkt] " + str(decoded))
+            # If there is an ack, send next packet
+            if decoded['ack'] == 0 or decoded['ack']:
+                log("[recv ack] " + str(decoded['ack']))
+                if decoded['ack'] in PACKETS:
+                    # remove the entry for his ACK's sequence number in PACKETS
+                    PACKETS.pop(decoded['ack'], None)
+                    OUT_COUNT -= 1
+        except (ValueError, KeyError, TypeError):
+            log("[recv corrupt packet]")
+    elif (get_time() - LAST_PACKET_TIME) > (TIMEOUT * 1000):
+        log("[error] timeout")
+        sys.exit(-1)
+
+send_next_packet()
+
+while True:
+    result = sock.recvfrom(MSG_SIZE)
+    if result:
+        LAST_PACKET_TIME = get_time()
+        (data, addr) = result
+        try:
+            decoded = json.loads(data.decode())
+            log("[recv pkt] " + str(decoded))
+            # If there is an ack, send next packet
+            if decoded['ack'] == 0 or decoded['ack']:
+                log("[recv ack] " + str(decoded['ack']))
+                if decoded['ack'] in PACKETS:
+                    # remove the entry for his ACK's sequence number in PACKETS
+                    PACKETS.pop(decoded['ack'], None)
+                    OUT_COUNT -= 1
+        except (ValueError, KeyError, TypeError):
+            log("[recv corrupt packet]")
+    elif (get_time() - LAST_PACKET_TIME) > (TIMEOUT * 1000):
+        log("[error] timeout")
+        sys.exit(-1)
+    if OUT_COUNT < SLIDING_WINDOW:
+        if (not send_next_packet()) and (not PACKETS):
+            break
+    log("got here")
+    transmit_timed_out()
+
+sys.exit(0)
+#Create the packets to be sent
+#get_packets()
+
+# Send the first packets
+#send_all_packets()
+
+# while True:
+#     log("ABOUT TO SLEEP")
+#     result = sock.recvfrom(MSG_SIZE)
+
+#     if result:
+#         LAST_PACKET_TIME = get_time()
+#         (data, addr) = result
+#         try:
+#             decoded = json.loads(data.decode())
+#             log("[recv pkt] " + str(decoded))
+#             # If there is an ack, send next packet
+#             if decoded['ack'] == 0 or decoded['ack']:
+#                 log("[recv ack] " + str(decoded['ack']))
+#                 if decoded['ack'] in PACKETS:
+#                     # remove the entry for his ACK's sequence number in PACKETS
+#                     PACKETS.pop(decoded['ack'], None)
+#         except (ValueError, KeyError, TypeError):
+#             log("[recv corrupt packet]")
+#     elif (get_time() - LAST_PACKET_TIME) > (TIMEOUT * 1000):
+#         log("[error] timeout")
+#         sys.exit(-1)
+
+#     if not PACKETS:
+#         break
+#     send_all_packets()
+
+# sys.exit(0)
+
+
+

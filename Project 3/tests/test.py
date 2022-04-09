@@ -1,0 +1,1 @@
+print(min('hello', 'world', 'hella'))

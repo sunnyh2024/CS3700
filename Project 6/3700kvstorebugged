@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+
+import sys, socket, select, time, json, random
+
+# Message Format: {"src": "<ID>", "dst": "<ID>", "leader": "<ID>", "type": "get", "MID": "<a unique string>", "key": "<some key>"}
+
+# Your ID number
+my_id = sys.argv[1]
+
+# The ID numbers of all the other replicas
+replica_ids = sys.argv[2:]
+
+# Connect to the network. All messages to/from other replicas and clients will
+# occur over this socket
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect(my_id)
+time.sleep(0.25)
+
+# keeps track of the last received append message
+LAST_HEARTBEAT = 0
+
+# election variables 
+MAJORITY = (len(replica_ids) + 1) // 2 + 1 #quorum required to be elected leader
+LEADER_VOTES = [] #machines that have voted for me
+LEADER_VOTE_COUNT = 0 
+MY_STATE = 'F' #F: Follower, C: Candidate, L: Leader
+ELECTION_TIMEOUT = random.randint(400, 600) 
+LEADER = None # ID
+CURRENT_VOTE = None # who my vote is going to in the current election
+NEXT_VOTE = None
+NEXT_VOTE_COMMIT = 0 # log length of my vote
+PREVIOUS_TERM = 0
+TIMED_OUT = False
+PREV_LEADER = None
+PREV_TERM = 0
+ELECTION_WAIT = None
+
+# leader variables
+NEXT_INDEX = {} #Current index of replicas
+DATA = {} #dictionary for get and put requests
+LAST_SENT_HEARTBEAT = 0 # tracks the last time we sent a heartbeat
+HEARTBEAT_INTERVAL = 100 #send a heartbeat every 100 ms
+LAST_COMMIT = 0 # index of last commited and applied message
+LAST_APPLIED = 0
+LOG = [] #log of requests
+LAST_HEARD_FROM = {} # Last time each replica is heard from
+MESSAGE_QUEUE = {}
+RECIVED_MESSAGES_FROM = []
+QUORUM_COUNT = {}
+
+# other constants
+SELECT_WAIT_TIME = 0.01 # 10 milliseconds
+TERMINATOR = b'}\n'
+TERM = 0
+buffer = b''
+
+# gets current time in milliseconds
+def get_time():
+	return int(time.time() * 1000)
+
+# starts an election with me as a candidate
+def start_election():
+	global LAST_COMMIT
+	global LAST_APPLIED
+	global TERM
+	global LEADER_VOTES
+	global LAST_HEARTBEAT
+	global LOG
+	global CURRENT_VOTE
+	global ELECTION_TIMEOUT
+	global NEXT_VOTE
+	global NEXT_VOTE_COMMIT
+
+	LAST_HEARTBEAT = get_time()
+	TERM += 1
+	LEADER_VOTES.append(my_id)
+	CURRENT_VOTE = my_id
+
+	NEXT_VOTE = my_id
+	NEXT_VOTE_COMMIT = LAST_COMMIT
+
+	for replica in replica_ids:
+		sock.send(json.dumps({'src': my_id, 
+		'dst': replica, 
+		'leader': my_id, 
+		'type': 'voteReq', 
+		'term': TERM,
+		'lastCommit' : LAST_COMMIT, 
+		'logLen': LAST_APPLIED}).encode() + b'\n')
+
+# main function for requests
+def handle_all_reqs(msg):
+	global ELECTION_TIMEOUT
+	if ((msg['type'] == 'get' or msg['type'] == 'put') and LEADER == 'None' or (MY_STATE == 'L' and MESSAGE_QUEUE_CLEARED == False)):
+		time = get_time()
+		if time in MESSAGE_QUEUE:
+			MESSAGE_QUEUE[time].append(msg)
+		else:
+			MESSAGE_QUEUE[time] = [msg]
+	elif msg['type'] == 'get':
+		handle_get_req(msg)
+	elif msg['type'] == 'put':
+		handle_put_req(msg)
+	elif msg['type'] == 'voteReq':
+		handle_vote_req(msg)
+	elif msg['type'] == 'vote':
+		handle_vote(msg)
+	elif msg['type'] == 'append':
+		handle_append(msg)
+	elif msg['type'] == 'response':
+		hande_append_response(msg)
+
+# handles and responds to a client get request
+def handle_get_req(msg):
+	global DATA
+	global LEADER
+	global LOG
+	global LAST_APPLIED
+
+	if my_id != LEADER:
+		send_redirect_msg(msg['src'], msg['MID'])
+	else:
+		if msg['key'] in DATA:
+			send_ok_msg(msg['src'], msg['MID'], DATA[msg['key']])
+		else:
+			send_fail_msg(msg['src'], msg['MID'])
+
+# handles and responds to a client put request
+def handle_put_req(msg):
+	global DATA 
+	global LEADER
+	global LOG
+	global LAST_APPLIED
+
+	if my_id != LEADER:
+		send_redirect_msg(msg['src'], msg['MID'])
+	else:
+		DATA[msg['key']] = msg['value']
+		msg['term'] =  TERM
+		LOG.append(msg)
+		LAST_APPLIED += 1
+		QUORUM_COUNT[LAST_APPLIED] = 1
+		send_heartbeat()
+		send_ok_msg(msg['src'], msg['MID'])
+
+# handles vote requests from candidate replicas
+def handle_vote_req(msg):
+	global TERM
+	global MY_STATE
+	global LAST_COMMIT
+	global CURRENT_VOTE_COMMIT
+	global CURRENT_VOTE
+	global CURRENT_VOTE_APPLIED
+	global LOG
+	global LEADER
+	global NEXT_VOTE_COMMIT
+	global NEXT_VOTE
+	
+	if (msg['lastCommit'] == NEXT_VOTE_COMMIT):
+		NEXT_VOTE = max(NEXT_VOTE, msg['src'])
+	elif(msg['lastCommit'] > NEXT_VOTE_COMMIT):
+		NEXT_VOTE_COMMIT = msg['lastCommit']
+		NEXT_VOTE = msg['src']
+	print(CURRENT_VOTE + msg['src'] + str(TIMED_OUT))
+	if ((CURRENT_VOTE == None or CURRENT_VOTE == msg['src']) and TIMED_OUT):
+		if msg['lastCommit'] >= LAST_COMMIT:
+			print('got here' + str(my_id))
+			CURRENT_VOTE = msg['src']
+			send_vote(msg['src'], msg['src'])
+
+		
+# handles messages from other replicas voting for me and leader election
+def handle_vote(msg):
+	global LEADER
+	global LEADER_VOTES
+	global LEADER_VOTE_COUNT
+	global MAJORITY
+	global LAST_HEARD_FROM
+	global replica_ids
+	global MY_STATE
+	global TERM
+	global PREV_LEADER
+	
+	if (MY_STATE == 'C'):
+		if (msg['src'] not in LEADER_VOTES):
+			LEADER_VOTES.append(msg['src'])
+		if (len(LEADER_VOTES) >= MAJORITY):
+			MY_STATE = 'L'
+			LEADER = my_id
+			TERM += 1
+			if PREV_LEADER in replica_ids:
+				replica_ids.remove(PREV_LEADER)
+			for replica in replica_ids:
+					NEXT_INDEX[replica] = LAST_COMMIT + 1
+					LAST_HEARD_FROM[replica] = get_time()
+			send_heartbeat()
+
+# handles append messages (currently just heartbeats)
+def handle_append(msg):
+	global LAST_HEARTBEAT
+	global LEADER
+	global TERM
+	global CURRENT_VOTE
+	global LAST_COMMIT 
+	global LOG
+	global LAST_APPLIED
+	global MY_STATE
+	global MESSAGE_QUEUE
+	global TIMED_OUT
+
+	LAST_HEARTBEAT = get_time()
+	MY_STATE = 'F'
+	LEADER = msg['src']
+	TIMED_OUT = False
+	if msg['leader'] != LEADER:
+		LEADER = msg['leader']
+	if msg['term'] > TERM:
+		TERM = msg['term']
+		CURRENT_VOTE = None
+	new_commit_index = msg['commitIndex']
+	for i in range(LAST_COMMIT + 1, min(new_commit_index + 1, len(LOG))):
+		commitMessage(i)
+
+	if len(msg['logs']) > 0:
+		next_index = msg['nextIndex']
+
+		for entry in msg['logs']:
+			entry['term'] = TERM
+			if next_index >= len(LOG):
+				LOG.append(entry)
+				LAST_APPLIED = LAST_APPLIED + 1
+			else:
+				LOG[next_index] = entry
+			next_index += 1
+	response = {'src': my_id, 'dst': LEADER, 'leader': LEADER, 'type': 'response', 'term': TERM, 'logLen': LAST_APPLIED, 'queue': MESSAGE_QUEUE}
+	sock.send(json.dumps(response).encode() + b'\n')
+
+
+def commitMessage(id):
+	global LAST_COMMIT
+	global DATA
+
+	msg = LOG[id]
+	DATA[msg['key']] = msg['value']
+	LAST_COMMIT += 1
+	send_ok_msg(msg['dst'], msg['MID'])
+
+
+# handles append response messages from replicas
+def hande_append_response(msg):
+	global NEXT_INDEX
+	global LAST_APPLIED
+	global LAST_HEARD_FROM
+	global MESSAGE_QUEUE
+	global RECIVED_MESSAGES_FROM
+
+	LAST_HEARD_FROM[msg['src']] = get_time()
+	last_applied = min(msg['logLen'] + 1, LAST_APPLIED)
+
+	if msg['src'] not in RECIVED_MESSAGES_FROM:
+		RECIVED_MESSAGES_FROM.append(msg['src'])
+		for timestamp in msg['queue']:
+			if int(timestamp) in MESSAGE_QUEUE:
+				MESSAGE_QUEUE[int(timestamp)].append(msg['queue'][timestamp])
+			else:
+				MESSAGE_QUEUE[int(timestamp)] = msg['queue'][timestamp]
+
+	for i in range(NEXT_INDEX[msg['src']], last_applied):
+		if i > LAST_COMMIT:
+			if (LOG[i]['term']) == TERM:
+				QUORUM_COUNT[i] = QUORUM_COUNT[i] + 1
+				if QUORUM_COUNT[i] == MAJORITY:
+					for j in range(LAST_COMMIT, i + 1):
+						commitMessage(j)
+	NEXT_INDEX[msg['src']] = last_applied 
+
+# sends a ok message through the socket
+def send_ok_msg(dest, mid, value=None):
+	if value is None:
+		to_send = {'src': my_id, 'dst': dest, 'leader': LEADER, 'type' : 'ok', 'MID': mid}
+	else:
+		to_send = {'src': my_id, 'dst': dest, 'leader': LEADER, 'type' : 'ok', 'MID': mid, 'value': value}
+	sock.send(json.dumps(to_send).encode() + b'\n')
+
+# sends a fail message through the socket
+def send_fail_msg(dest, mid):
+	sock.send(json.dumps({'src': my_id, 'dst': dest, 'leader': LEADER, 'type' : 'fail', 'MID': mid}).encode() + b'\n')
+
+# sends a redirect message through the socket
+def send_redirect_msg(dest, mid):
+	sock.send(json.dumps({'src': my_id, 'dst': dest, 'leader': LEADER, 'type' : 'redirect', 'MID': mid}).encode() + b'\n')
+
+# sends a vote message through the socket
+def send_vote(dest, vote):
+	for _ in range(3):
+		sock.send(json.dumps({'src': my_id, 'dst': dest, 'leader': vote, 'type' : 'vote', 'MID': ''}).encode() + b'\n')
+
+# checks if any replicas have timed out, and if so, removes them from the ID list
+def remove_timed_out_replicas():
+	global replica_ids
+	global LAST_HEARD_FROM
+
+	for replica in replica_ids:
+		if replica in LAST_HEARD_FROM:
+			if get_time() > (LAST_HEARD_FROM[replica] + 1000):
+				replica_ids.remove(replica)
+
+# sends a heartbeat message to the other replicas
+def send_heartbeat():
+	global LAST_SENT_HEARTBEAT
+	global HEARTBEAT_INTERVAL
+	global TERM
+	global LEADER
+	global LAST_APPLIED
+
+	if get_time() > LAST_SENT_HEARTBEAT + HEARTBEAT_INTERVAL:
+		LAST_SENT_HEARTBEAT = get_time()
+		for replica in replica_ids:
+			data = {
+					'src': my_id,
+					'dst': replica,
+					'leader': LEADER, 
+					'type': 'append',
+					'commitIndex': LAST_COMMIT,
+					'term': TERM,
+					'logLen': LAST_APPLIED,
+					'nextIndex' : NEXT_INDEX[replica],
+					'logs' : LOG[NEXT_INDEX[replica]:]
+					}
+			sock.send(json.dumps(data).encode() + b'\n')
+
+# Receive 
+def recv_msgs(sock):
+	global buffer
+
+	fresh_buf = sock.recv(16384)
+
+	# is this sock shutting down?
+	if len(fresh_buf) == 0:
+		return None
+
+	buffer += fresh_buf	
+
+	msgs = []
+	while TERMINATOR in buffer:
+		position = buffer.find(TERMINATOR) + len(TERMINATOR)
+		msgs.append(json.loads(buffer[:position - 1].decode()))  # -1 to remove the \n, which json.loads won't want
+		buffer = buffer[position:]
+
+	return msgs
+
+def read_message_queue():
+	global MESSAGE_QUEUE
+	global MESSAGE_QUEUE_CLEARED
+
+	for time in sorted(MESSAGE_QUEUE):
+		for msg in MESSAGE_QUEUE[time]:
+			# handle a client get request
+			if msg['type'] == 'get':
+				handle_put_get(msg)
+			# handle a client put request
+			if msg['type'] == 'put':
+				handle_put_req(msg)
+
+	MESSAGE_QUEUE = {}
+	MESSAGE_QUEUE_CLEARED = True
+
+if __name__ == '__main__':
+
+	# start an initial election to determine a leader
+	start_election()
+
+	while True:
+		ready = select.select([sock], [], [], SELECT_WAIT_TIME)[0]
+		
+		if sock in ready:
+			msgs = recv_msgs(sock)
+
+			for msg in msgs:
+				handle_all_reqs(msg)
+				print(msg)
+		# if I'm leader, send heartbeat if necessary
+		if LEADER == my_id:
+			send_heartbeat()
+			remove_timed_out_replicas()
+		if MY_STATE == 'L' and len(RECIVED_MESSAGES_FROM) == len(replica_ids):
+			read_message_queue()
+		# if I haven't received a heartbeat yet, start a new election
+		if (LEADER != my_id) and (get_time() > LAST_HEARTBEAT + ELECTION_TIMEOUT):
+			if (not TIMED_OUT):
+				TIMED_OUT = True
+				PREV_LEADER = LEADER
+				PREV_TERM = TERM
+			if MY_STATE == 'C':
+				if NEXT_VOTE == my_id:
+					if ELECTION_WAIT == None:
+						ELECTION_WAIT = get_time() + random.randrange(100,300)
+					elif (get_time > ELECTION_WAIT):
+						ELECTION_TIMEOUT = random.randint(400, 600)
+						start_election()
+				else:
+					LAST_HEARTBEAT = get_time()
+					CURRENT_VOTE = None
+			elif(CURRENT_VOTE == None):
+				MY_STATE = 'C'
+				start_election()
+		

@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+
+import socket
+import sys
+import ssl
+import argparse
+
+DESCRIPT = "Communicates with server in the following format: <-p port> <-s> hostname NEUID"
+
+# creating a parser for the command line input
+parser = argparse.ArgumentParser(description=DESCRIPT)
+parser.add_argument('-p', dest='port', type=int, default=27993, required=False)
+parser.add_argument('-s', dest='socket', action='store_true', required=False)
+parser.add_argument('hostname', type=str)
+parser.add_argument('NEUID', type=str)
+args = parser.parse_args()
+
+# constants
+HOST = args.hostname
+PORT = 27993
+
+# Changing the socket number according to the parser input
+if args.socket:
+    PORT = 27994
+elif args.port is not None:
+    PORT = args.port
+
+
+def decode_socket(sock):
+    '''Receives the input from the given socket and returns a list of the of the 'words' in the message'''
+    rec = sock.recv(8192).decode()
+    while not rec.endswith('\n'):
+        rec += sock.recv(8192).decode()
+    return rec.rstrip().split()
+
+
+# initiating the socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+# wrapping the socket if the user inputs -s
+if args.socket:
+    s = ssl.wrap_socket(s)
+
+s.connect((HOST, PORT))
+
+msg = 'ex_string HELLO ' + args.NEUID + '\n'
+s.sendall(str.encode(msg))
+
+input = decode_socket(s)
+
+# keep going through inputs until the server stops sending FIND statements
+while input[1] == 'FIND':
+    target = input[2]
+    given = input[3]
+    count = given.count(target)
+
+    msg = 'ex_string COUNT ' + str(count) + '\n'
+    s.sendall(str.encode(msg))
+
+    input = decode_socket(s)
+
+# ensuring the last message is a BYE message
+if input[1] == 'BYE':
+    print(input[2])
+else:
+    print('Could not find secret flag')

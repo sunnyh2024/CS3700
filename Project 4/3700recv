@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+#
+# CS3700, Fall 2021
+# TCP Project Starter Code
+
+
+import datetime
+import json
+import sys
+import socket
+
+from base64 import b64decode
+
+
+def log(string):
+    sys.stderr.write(datetime.datetime.now().strftime(
+        "%H:%M:%S.%f") + " 3700recv: " + string + "\n")
+
+MSG_SIZE = 1500
+TIMEOUT = 30
+SEQUENCE = 0
+ORDERED_PACKETS = [] # Reconstructs the packets in order as we get more from send
+OTHER_PACKETS = {} # Keeps all the packets we have received that are not in order
+
+# Bind to localhost and an ephemeral port
+UDP_IP = "127.0.0.1"
+UDP_PORT = int(sys.argv[1])
+
+# Set up the socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind((UDP_IP, UDP_PORT))
+sock.settimeout(TIMEOUT)
+
+# Get port we bound to
+UDP_PORT = sock.getsockname()[1]
+log("[bound] " + str(UDP_PORT))
+
+
+# Now listen for packets
+while True:
+    result = sock.recvfrom(MSG_SIZE)
+
+    # If nothing is ready, we hit the timeout
+    if result:
+        (data, addr) = result
+        try:
+            decoded = json.loads(data)
+            # If there is data, we accept it and print it out
+            if (decoded['data']):
+                data = b64decode(decoded['data'].encode())
+                # If we receive data, we assume it's in-order
+                log("[recv data] " + str(decoded['sequence']) +
+                    " (" + str(len(data)) + ") ACCEPTED (in-order)")
+                # Add the packet to the ordered list if sequence numbers match else add to other dict
+                if decoded['sequence'] == SEQUENCE:
+                    SEQUENCE += len(data)
+                    ORDERED_PACKETS.append(decoded)
+                    while SEQUENCE in OTHER_PACKETS.keys():
+                        packet = OTHER_PACKETS[SEQUENCE]
+                        ORDERED_PACKETS.append(packet)
+                        SEQUENCE += len(data)
+                else:
+                    OTHER_PACKETS[decoded['sequence']] = decoded
+
+            # Send back an ack to the sender
+            length = len(b64decode(decoded['data'].encode()))
+            msg = json.dumps(
+                {"ack": decoded['sequence'], 'length': length})
+            log("ABOUT TO SEND " + msg)
+            sent = sock.sendto(msg.encode(), addr)
+            log("[sent] " + str(sent))
+            if sent < len(msg):
+                log("[error] unable to fully send packet")
+
+            # If the EOF flag is set, exit
+            p = ORDERED_PACKETS[-1] if ORDERED_PACKETS else {'eof': False}
+            if (decoded['eof'] and decoded['sequence'] == SEQUENCE) or p['eof']:
+                for packet in ORDERED_PACKETS:
+                    sys.stdout.buffer.write(b64decode(packet['data'].encode()))
+                log("[completed]")
+                sys.exit(0)
+
+        # Error handling
+        except (ValueError, KeyError, TypeError) as e:
+            log("[recv corrupt packet]")
+            raise e
+    else:
+        log("[error] timeout")
+        sys.exit(-1)
